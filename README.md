@@ -55,11 +55,11 @@ Mean Percentage of the Salary Cap: **0.0552**
 
 >**Mean Absolute Error**
 >
->: Multiple Linear Regression: **0.014824140704958222**
+> Multiple Linear Regression: **0.014824140704958222**
 >
->: Neural Network: **0.019025536688456527**
+> Neural Network: **0.019025536688456527**
 >
->: Simple Linear Regression: **0.023563290128380265**
+> Simple Linear Regression: **0.023563290128380265**
 
 ![NN Predicted vs Actual](https://xanderhieken.github.io/assets/NNPlot.png =480)
 
