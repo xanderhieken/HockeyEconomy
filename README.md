@@ -21,7 +21,7 @@ In the data folder of the GitHub repository, you will find four CSV files:
 >
 >* If you would rather skip to the analysis, I have also included the processed data file that gets exported from RStudio
 
-**4. `CleanHockeyData.csv`**
+4. `CleanHockeyData.csv`
 * Contains the combined, processed, and exported data from RStudio that is used for analysis in Python
 
 ## The Process
