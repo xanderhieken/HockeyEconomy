@@ -61,7 +61,7 @@ Mean Percentage of the Salary Cap: **0.0552**
 >
 > Simple Linear Regression: **0.023563290128380265**
 
-![NN Predicted vs Actual](https://xanderhieken.github.io/assets/NNPlot.png =600x600)
+![NN Predicted vs Actual](https://xanderhieken.github.io/assets/NNPlot.png)
 
 ## Author
 **Xander Hieken**
