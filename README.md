@@ -51,7 +51,7 @@ In the data folder of the GitHub repository, you will find four CSV files:
 **Surprisingly, multiple linear regression wound up narrowly outperforming the neural network in terms of prediction accuracy. However, none of the models appear to be effective enough to make reliable player valuations.**
 
 ```
-Target Variable = pctCap #Percentage of the Salary Cap
+Target Variable = pctCap
 mean(pctCap) = 0.0552
 
 Multiple Linear Regression = 0.014824140704958222
