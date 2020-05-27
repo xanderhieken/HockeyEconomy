@@ -7,6 +7,7 @@ There comes a point in *every* season of *every* professional sport where teams,
 
 ## The Data
 In the data folder of the GitHub repository, you will find four CSV files:
+
 **1. `SkaterStats.csv`**
 * Contains basic statistics from [NHL.com/stats](http://www.nhl.com/stats/skaters?aggregate=0&reportType=season&seasonFrom=20092010&seasonTo=20182019&gameType=2&status=active&filter=gamesPlayed,gte,0&sort=a_skaterFullName&page=0&pageSize=100) for all active players
 
@@ -27,15 +28,20 @@ In the data folder of the GitHub repository, you will find four CSV files:
 ## The Process
 **Data Preparation**
 * I reduced the data down to a single record for each individual player for the season they signed their current contract.
+
 	* Each record needed to include the player's statistics for that season plus the season prior to signing because this allows us to see how their performance might have changed from season to season
+	
 * Then, I used the raw hockey statistics to create **per game**, **per minute**, and **per 60 minutes** versions of each of the original statistics to try to control for things like ice time and injuries, which are out of the players' control.
+
 	* I wound up sticking with just the **per 60 minutes** statistics for the analysis because it generated better predictions than the raw statistics, and the results were easier to interpret than breaking things down to a *per minute* basis.
+	
 * The data was further reduced to only include players with a minimum of 25 games played because a good handful of the players had a few really good games before getting injured or reassigned to a different league, which skews their *per 60 minute* rates for the season.
 
 **Analysis**
 * The neural network was built with Keras and uses all of the features in the dataset:
 
 ![Neural Network](https://xanderhieken.github.io/assets/NeuralNetwork.png)
+
 >Next, I had to test the correlation of all the features to figure out which one(s) have the highest correlation with the target (Percentage of Cap Space), so I could use those features for regression.
 * Simple linear regression used **Assists Per 60 Minutes** since it had the highest correlation with the target.
 
@@ -48,13 +54,14 @@ Target Variable: **Percentage of the Salary Cap**
 Mean Percentage of the Salary Cap: **0.0552**
 
 >**Mean Absolute Error**
+>
 >: Multiple Linear Regression: **0.014824140704958222**
+>
 >: Neural Network: **0.019025536688456527**
+>
 >: Simple Linear Regression: **0.023563290128380265**
 
-
-![NN Predicted vs Actual](https://xanderhieken.github.io/assets/NNPlot.png)
-
+![NN Predicted vs Actual](https://xanderhieken.github.io/assets/NNPlot.png =480)
 
 ## Author
 **Xander Hieken**
