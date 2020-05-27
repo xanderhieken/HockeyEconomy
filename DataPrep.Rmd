@@ -1,0 +1,733 @@
+---
+title: "Hockey Economy Data Preparation"
+author: "Xander Hieken"
+output: html_document
+---
+```{r, warning=FALSE, message=FALSE}
+#Load libraries
+library(plyr)
+library(stringr)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(readxl)
+library(data.table)
+library(tidyverse)
+library(randomForest)
+library(randomForestExplainer)
+require(caTools)
+library(e1071)
+library(caret)
+library(klaR)
+library(broom)
+library(ridge)
+library(glmnet)
+library(corrplot)
+library(ade4)
+
+options(scipen=999) #Turns off scientific notation
+```
+
+```{r, warning=FALSE, message=FALSE}
+#Load data
+SkaterStats <- read.csv("SkaterStats.csv")
+SkaterStats <- SkaterStats %>% distinct(Player, Season, .keep_all = TRUE)
+CapFriendly <- read.csv("CapFriendly.csv")
+taxes <- read.csv("Taxes.csv")
+
+#CapFriendly "PLAYER" column has a number followed by a period and a space before the player's actual name
+#I want to remove everything before the actual player's name
+CapFriendly$PLAYER <- gsub(".*\\. ","",CapFriendly$PLAYER)
+
+#Combine CapFriendly data with SkaterStats
+Skaters <- merge(SkaterStats, CapFriendly, by.x = ("Player"), by.y = ("PLAYER"))
+
+#Duplicating the merged dataframe for cleaning
+testDF <- Skaters
+
+#Get rid of all rows for players on entry-level contracts since they have no prior data
+testDF <- subset(testDF, SIGNING != "ELC")
+
+#Get rid of all rows for defensemen, since their performance is judged by different factors than forwards
+testDF <- subset(testDF, Pos != "D")
+
+#Four players with active contracts signed prior to 2012.
+#These stats don't go back far enough to show the rest of the league when those contracts were signed, so I am dropping those players.
+dropPlayers <- c("Alex Ovechkin", "Johan Franzen", "Henrik Zetterberg", "Jeff Carter")
+testDF <- testDF[!testDF$Player %in% dropPlayers,]
+
+#Getting rid of unnecessary columns
+dropList <- c("X", "P.GP.x", "S.", "FOW.", "TEAM", "AGE", "POS", "HANDED", "SLIDE.CAND.", "WAIVERS.EXEMPT", "ARB..ELIG", "GP.y", "G.y", "A.y", "P.y", "P.GP.y", "X....y", "Sh", "Sh.", "TOI", "W", "L", "SO", "GAA", "Sv.", "TYPE", "EXTENSION", "ARB..ELIG.1", "ARB..REQ", "CLAUSE", "CAP.HIT", "CAP.HIT..", "SALARY", "BASE.SALARY", "MINORS", "S.BONUS", "P.BONUS")
+
+testDF <- testDF[, !colnames(testDF) %in% dropList]
+
+#Remove all non-alphanumeric characters from the "AAV" column
+testDF$AAV <- str_replace_all(testDF$AAV,"[^[:alnum:]]","")
+
+#Converting "Team" column to character vector, so I can clean it up
+testDF$Team <- lapply(testDF$Team, as.character)
+
+#Only keeping the last team the player was with for that season (for players with multiple teams)
+for (i in 1:length(testDF$Team)){
+  if (nchar(testDF$Team[[i]]) > 3){
+      testDF$Team[[i]] <- substr(testDF$Team[[i]], nchar(testDF$Team[[i]])-2, nchar(testDF$Team[[i]])) #keeps last 3 characters
+  }
+}
+
+#Converting "TOI.GP" column to character vector, so I can convert minutes and seconds into a decimal number
+testDF$TOI.GP <- lapply(testDF$TOI.GP, as.character)
+
+#Converting "Time On Ice Per Game Played" (TOI.GP) into minutes as a decimal rather than minutes and seconds
+for (i in 1:length(testDF$TOI.GP)){
+  testDF$TOI.GP[[i]] <- sapply(strsplit(testDF$TOI.GP[[i]],":"),
+    function(x){
+      x <- as.numeric(x)
+      x[1]+x[2]/60
+    }
+  )
+}
+
+#Converting listed data back into its original format
+testDF <- as.data.frame(lapply(testDF, unlist))
+
+#Converting "Team" into a factor
+testDF[, 'Team'] <- as.factor(testDF[, 'Team'])
+
+#Fixing the format of the "Season" column to only show the year the season ended
+testDF$Season <- as.numeric(substr(testDF$Season, 5,8))
+
+#Making sure features that should be factors are set as factors (this also gets rid of factor levels that no longer exist)
+testDF$S.C <- factor(testDF$S.C)
+testDF$Player <- factor(testDF$Player)
+testDF$Team <- factor(testDF$Team)
+testDF$Pos <- factor(testDF$Pos)
+testDF$SIGNING <- factor(testDF$SIGNING)
+testDF$EXPIRY <- factor(testDF$EXPIRY)
+testDF$EXP..YEAR <- as.factor(testDF$EXP..YEAR)
+
+#AAV needs to be numeric rather than a factor
+#Factor has to convert to characters before changing to numeric
+#If you convert straight to numeric, it assigns the "factor number" as the value instead of just re-labeling the text as a number
+testDF$AAV <- lapply(testDF$AAV, as.character)
+testDF$AAV <- as.numeric(testDF$AAV)
+
+#DATE.OF.BIRTH and SIGNING.DATE need to be dates rather than factors
+testDF[, 'DATE.OF.BIRTH'] <- as.Date(testDF[, 'DATE.OF.BIRTH'], format='%b %d, %Y')
+testDF[, 'SIGNING.DATE'] <- as.Date(testDF[, 'SIGNING.DATE'], format='%b %d, %Y')
+
+#Rename variables to make them easier to interpret
+names(testDF) <- c("Name", "SeasonEnding", "Team", "Handed", "Position", "GamesPlayed", "Goals", "Assists", "Points", "PlusMinus", "PenaltyMinutes", "EvenStrGoals", "EvenStrPoints", "ppGoals", "ppPoints", "shGoals", "shPoints", "GameWinningGoals", "Shots", "avgTOI", "Birthday", "Country", "ContractDate", "AgeAtSigning", "ContractLength", "SigningStatus", "EndStatus", "ContractEnd", "AAV")
+
+for (i in 1:length(testDF$AAV)){
+  testDF$SalaryCap[[i]] <- switch(as.character(testDF$SeasonEnding[[i]]), "2010" = 56800000, "2011" = 59400000, "2012" = 64300000, "2013" = 60000000, "2014" = 64300000, "2015" = 69000000, "2016" = 71400000, "2017" = 73000000, "2018" = 75000000, "2019" = 79500000)
+  testDF$pctCap[[i]] <- ((testDF$AAV[[i]]/testDF$SalaryCap[[i]]))
+  testDF$TOI[[i]] <- (testDF$avgTOI[[i]]*testDF$GamesPlayed[[i]])
+  
+  #Adding columns to standardize statistics per 60 minutes of ice time (60 suffix on feature names)
+  testDF$Goals60[[i]] <- (testDF$Goals[[i]]/testDF$TOI[[i]]*60)
+  testDF$Assists60[[i]] <- (testDF$Assists[[i]]/testDF$TOI[[i]]*60)
+  testDF$Points60[[i]] <- (testDF$Points[[i]]/testDF$TOI[[i]]*60)
+  testDF$PlusMinus60[[i]] <- (testDF$PlusMinus[[i]]/testDF$TOI[[i]]*60)
+  testDF$PenaltyMinutes60[[i]] <- (testDF$PenaltyMinutes[[i]]/testDF$TOI[[i]]*60)
+  testDF$EvenStrGoals60[[i]] <- (testDF$EvenStrGoals[[i]]/testDF$TOI[[i]]*60)
+  testDF$EvenStrPoints60[[i]] <- (testDF$EvenStrPoints[[i]]/testDF$TOI[[i]]*60)
+  testDF$ppGoals60[[i]] <- (testDF$ppGoals[[i]]/testDF$TOI[[i]]*60)
+  testDF$ppPoints60[[i]] <- (testDF$ppPoints[[i]]/testDF$TOI[[i]]*60)
+  testDF$shGoals60[[i]] <- (testDF$shGoals[[i]]/testDF$TOI[[i]]*60)
+  testDF$shPoints60[[i]] <- (testDF$shPoints[[i]]/testDF$TOI[[i]]*60)
+  testDF$GameWinningGoals60[[i]] <- (testDF$GameWinningGoals[[i]]/testDF$TOI[[i]]*60)
+  testDF$Shots60[[i]] <- (testDF$Shots[[i]]/testDF$TOI[[i]]*60)
+}
+
+#Adding the tax data
+dfTaxed <- merge(testDF, taxes, by="Team")
+
+#duplicating the dataframe to test
+twoYears <- dfTaxed
+
+#Adding columns to show which seasons we want in our final dataframe
+for (i in 1:length(twoYears$AAV)){
+  if (month(twoYears$ContractDate[[i]]) < 5){
+  twoYears$contractSeason[[i]] <- year(twoYears$ContractDate[[i]])-1
+  twoYears$prevSeason[[i]] <- twoYears$contractSeason[[i]]-1
+  }else{
+  twoYears$contractSeason[[i]] <- year(twoYears$ContractDate[[i]])
+  twoYears$prevSeason[[i]] <- twoYears$contractSeason[[i]]-1
+  }
+}
+
+#I need to drop all the players that didn't play in the NHL the season before signing their contract
+toDrop <- c("Andy Miele", "Ben Street", "Michael Sgarbossa", "Garrett Wilson", "Paul Carey", "Tyler Pitlick", "Valeri Nichushkin", "Andrew Agozzino", "Patrick Brown", "Sam Carrick", "Tyler Gaudet", "Chase De Leo", "Daniel Sprong", "JC Lipon", "Kurtis Gabriel", "Michael Mersch", "Robby Fabbri", "Ross Johnston", "Turner Elson", "Andrew Poturalski", "Connor Brown", "Riley Barber", "Scott Wilson", 
+            "Sebastian Aho", "Colby Cave", "Steven Fogarty", "Travis Boyd", "Adam Johnson", "Anthony Greco", "Anton Blidh", "Antti Suomela", "Blake Pietila", "Brad Malone", "Brendan Gaunce", "Colin Blackwell", "Cory Conacher", "Curtis Lazar", "Danick Martel", "Daniel Carr", "Danny O'Regan", "Dominic Toninato", "Dominic Turgeon", "Dylan Gambrell", "Eric Robinson", "Jack Rodewald", "Jacob Nilsson", 
+            "Joseph Blandisi", "Justin Kloos", "Kalle Kossila", "Kevin Roy", "Kyle Rau", "Laurent Dauphin", "Chris Stewart", "David Krejci", "Ilya Kovalchuk", 	"Jay Beagle", "Chris Mueller", "Alexander Radulov", "Clark Bishop", "Conor Garland", "Jayce Hawryluk", "Joseph Gambardella", "Justin Bailey", "Justin Dowling", "Josh Currie", "Lukas Radil", "Luke Johnson", "Luke Witkowski", "Mackenzie MacEachern", 
+            "Mark Letestu", "Marko Dano", "Martin Frk", "Matt Puempel", "Max McCormick", "Michael Bunting", "Michael Chaput", "Michael Dal Colle", "Micheal Haley", "Nico Sturm", "Patrick Russell", "Reid Boucher", "Ryan Lomberg", "Sheldon Dries", "Sheldon Rempal", "Sonny Milano", "Teddy Blueger", "Tobias Rieder", "Trevor Moore", "Tyrell Goulbourne", "Valentin Zykov", "Vinni Lettieri", "Vladislav Kamenev",
+            "Zac Dalpe")
+twoYears <- twoYears[!twoYears$Name %in% toDrop,]
+
+for (i in 1:length(twoYears$AAV)){   #Loop through each row of the dataframe
+  #Get the row of this player's previous season
+  prev <- which((twoYears$SeasonEnding == twoYears$prevSeason) & (twoYears$Name == twoYears$Name[[i]]))
+  
+  #Create new features for previous year ("py" prefix on feature name)
+  twoYears$pyTOI[[i]] <- (twoYears$avgTOI[[prev]]*twoYears$GamesPlayed[[prev]])
+  
+  #Adding columns to standardize statistics per 60 minutes of ice time (60 suffix on feature names)
+  twoYears$pyGoals60[[i]] <- (twoYears$Goals[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyAssists60[[i]] <- (twoYears$Assists[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyPoints60[[i]] <- (twoYears$Points[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyPlusMinus60[[i]] <- (twoYears$PlusMinus[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyPenaltyMinutes60[[i]] <- (twoYears$PenaltyMinutes[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyEvenStrGoals60[[i]] <- (twoYears$EvenStrGoals[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyEvenStrPoints60[[i]] <- (twoYears$EvenStrPoints[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyppGoals60[[i]] <- (twoYears$ppGoals[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyppPoints60[[i]] <- (twoYears$ppPoints[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyshGoals60[[i]] <- (twoYears$shGoals[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyshPoints60[[i]] <- (twoYears$shPoints[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyGameWinningGoals60[[i]] <- (twoYears$GameWinningGoals[[prev]]/twoYears$pyTOI[[i]]*60)
+  twoYears$pyShots60[[i]] <- (twoYears$Shots[[prev]]/twoYears$pyTOI[[i]]*60)
+  
+  #Create new features for percent change
+  twoYears$GoalsChange[[i]] <- (twoYears$Goals60[[i]] - twoYears$pyGoals60[[i]])/twoYears$pyGoals60[[i]]
+  twoYears$AssistsChange[[i]] <- (twoYears$Assists60[[i]] - twoYears$pyAssists60[[i]])/twoYears$pyAssists60[[i]]
+  twoYears$PointsChange[[i]] <- (twoYears$Points60[[i]] - twoYears$pyPoints60[[i]])/twoYears$pyPoints60[[i]]
+  twoYears$PlusMinusChange[[i]] <- (twoYears$PlusMinus60[[i]] - twoYears$pyPlusMinus60[[i]])/twoYears$pyPlusMinus60[[i]]
+  twoYears$PenaltyMinutesChange[[i]] <- (twoYears$PenaltyMinutes60[[i]] - twoYears$pyPenaltyMinutes60[[i]])/twoYears$pyPenaltyMinutes60[[i]]
+  twoYears$EvenStrGoalsChange[[i]] <- (twoYears$EvenStrGoals60[[i]] - twoYears$pyEvenStrGoals60[[i]])/twoYears$pyEvenStrGoals60[[i]]
+  twoYears$EvenStrPointsChange[[i]] <- (twoYears$EvenStrPoints60[[i]] - twoYears$pyEvenStrPoints60[[i]])/twoYears$pyEvenStrPoints60[[i]]
+  twoYears$ppGoalsChange[[i]] <- (twoYears$ppGoals60[[i]] - twoYears$pyppGoals60[[i]])/twoYears$pyppGoals60[[i]]
+  twoYears$ppPointsChange[[i]] <- (twoYears$ppPoints60[[i]] - twoYears$pyppPoints60[[i]])/twoYears$pyppPoints60[[i]]
+  twoYears$shGoalsChange[[i]] <- (twoYears$shGoals60[[i]] - twoYears$pyshGoals60[[i]])/twoYears$pyshGoals60[[i]]
+  twoYears$shPointsChange[[i]] <- (twoYears$shPoints60[[i]] - twoYears$pyshPoints60[[i]])/twoYears$pyshPoints60[[i]]
+  twoYears$GameWinningGoalsChange[[i]] <- (twoYears$GameWinningGoals60[[i]] - twoYears$pyGameWinningGoals60[[i]])/twoYears$pyGameWinningGoals60[[i]]
+  twoYears$ShotsChange[[i]] <- (twoYears$Shots60[[i]] - twoYears$pyShots60[[i]])/twoYears$pyShots60[[i]]
+  twoYears$TOIChange[[i]] <- (twoYears$TOI[[i]] - twoYears$pyTOI[[i]])/twoYears$pyTOI[[i]]
+}
+
+#Cleaning up all the Inf and NaN values from those percent change calculations
+twoYears[twoYears == -Inf] <- 0
+twoYears[twoYears == Inf] <- 0
+twoYears[is.na(twoYears)] <- 0
+
+#Creating a new dataframe that only contains one row for each player
+#That single row contains statistics for the two seasons leading up to the contract signing along with features for percent change from the previous year to the contract year.
+
+onlyContractYear <- data.frame()
+for (i in 1:nrow(twoYears)){
+  if (twoYears$SeasonEnding[[i]] == twoYears$contractSeason[[i]]){
+  onlyContractYear <- rbind(onlyContractYear , twoYears[i,])
+  }
+}
+
+onlyContractYear <- subset(onlyContractYear, GamesPlayed > 25)
+
+#Getting rid of unnecessary columns
+dropList <- c("SigningStatus", "EndStatus", "PlusMinus", "avgTOI", "Shots", "GameWinningGoals", "shPoints", "shGoals", "ppPoints", "ppGoals", "EvenStrGoals", "EvenStrPoints", "PenaltyMinutes", "Points", "Assists", "Goals", "GamesPlayed", "SeasonEnding", "ContractEnd")
+
+onlyContractYear <- onlyContractYear[, !colnames(onlyContractYear) %in% dropList]
+
+for (i in 1:length(onlyContractYear$AAV)){ 
+  #Create features for calculating net income and locally adjusted net income
+  onlyContractYear$fTaxes[[i]] <- ((onlyContractYear$AAV[[i]] - onlyContractYear$fBracket[[i]]) * onlyContractYear$fRate[[i]]) + onlyContractYear$fMarginal[[i]]
+  onlyContractYear$sTaxes[[i]] <- ((onlyContractYear$AAV[[i]] - onlyContractYear$sBracket[[i]]) * onlyContractYear$sRate[[i]]) + onlyContractYear$sMarginal[[i]]
+  onlyContractYear$lTaxes[[i]] <- (onlyContractYear$AAV[[i]] * onlyContractYear$Local[[i]])
+  onlyContractYear$Escrow[[i]] <- onlyContractYear$AAV[[i]] * 0.135
+  onlyContractYear$Agent[[i]] <- onlyContractYear$AAV[[i]] * 0.04
+  onlyContractYear$netIncome[[i]] <- onlyContractYear$AAV[[i]] - onlyContractYear$fTaxes[[i]] - onlyContractYear$sTaxes[[i]] - onlyContractYear$lTaxes[[i]] - onlyContractYear$Escrow[[i]] - onlyContractYear$Agent[[i]]
+  onlyContractYear$LANI[[i]] <- onlyContractYear$netIncome[[i]]/onlyContractYear$COLA[[i]]
+}
+
+#Creating the final dataframe
+df <- onlyContractYear
+
+#One-hot encoding categorical features 
+oneHot = c("Country", "Team", "Handed", "Position")
+for (i in oneHot){
+  dummies <- acm.disjonctif(df[i])
+  df[i] <- NULL
+  df <- cbind(df, dummies)
+}
+
+```
+
+```{r}
+#Exporting the prepared dataset
+ write.csv(df, "CleanHockeyData.csv")
+```
+
+```
+This was being used to create rankings for every statistic for each season.
+The final model standardizes all statistics per 60 minutes of ice time, so there's no reason to include rankings, per game statistics, or per minute statistics.
+"LR" suffix = League Ranking
+"PG" suffix = Per Game
+"PM" suffix = Per Minute
+
+#Create a dataframe for 2010
+df2010 <- subset(dfTaxed, SeasonEnding == "2010")
+df2010$GamesPlayedLR <- rank(-df2010$GamesPlayed, ties.method = "min")
+df2010$GoalsLR <- rank(-df2010$Goals, ties.method = "min")
+df2010$AssistsLR <- rank(-df2010$Assists, ties.method = "min")
+df2010$PointsLR <- rank(-df2010$Points, ties.method = "min")
+df2010$PlusMinusLR <- rank(-df2010$PlusMinus, ties.method = "min")
+df2010$PenaltyMinutesLR <- rank(-df2010$PenaltyMinutes, ties.method = "min")
+df2010$EvenStrGoalsLR <- rank(-df2010$EvenStrGoals, ties.method = "min")
+df2010$EvenStrPointsLR <- rank(-df2010$EvenStrPoints, ties.method = "min")
+df2010$ppGoalsLR <- rank(-df2010$ppGoals, ties.method = "min")
+df2010$ppPointsLR <- rank(-df2010$ppPoints, ties.method = "min")
+df2010$shGoalsLR <- rank(-df2010$shGoals, ties.method = "min")
+df2010$shPointsLR <- rank(-df2010$shPoints, ties.method = "min")
+df2010$GameWinningGoalsLR <- rank(-df2010$GameWinningGoals, ties.method = "min")
+df2010$ShotsLR <- rank(-df2010$Shots, ties.method = "min")
+df2010$avgTOILR <- rank(-df2010$avgTOI, ties.method = "min")
+df2010$AAVLR <- rank(-df2010$AAV, ties.method = "min")
+df2010$GoalsPGLR <- rank(-df2010$GoalsPG, ties.method = "min")
+df2010$AssistsPGLR <- rank(-df2010$AssistsPG, ties.method = "min")
+df2010$PointsPGLR <- rank(-df2010$PointsPG, ties.method = "min")
+df2010$PlusMinusPGLR <- rank(-df2010$PlusMinusPG, ties.method = "min")
+df2010$PenaltyMinutesPGLR <- rank(-df2010$PenaltyMinutesPG, ties.method = "min")
+df2010$EvenStrGoalsPGLR <- rank(-df2010$EvenStrGoalsPG, ties.method = "min")
+df2010$EvenStrPointsPGLR <- rank(-df2010$EvenStrPointsPG, ties.method = "min")
+df2010$ppGoalsPGLR <- rank(-df2010$ppGoalsPG, ties.method = "min")
+df2010$ppPointsPGLR <- rank(-df2010$ppPointsPG, ties.method = "min")
+df2010$shGoalsPGLR <- rank(-df2010$shGoalsPG, ties.method = "min")
+df2010$shPointsPGLR <- rank(-df2010$shPointsPG, ties.method = "min")
+df2010$GameWinningGoalsPGLR <- rank(-df2010$GameWinningGoalsPG, ties.method = "min")
+df2010$ShotsPGLR <- rank(-df2010$ShotsPG, ties.method = "min")
+df2010$AAVPGLR <- rank(-df2010$AAVPG, ties.method = "min")
+df2010$GoalsPMLR <- rank(-df2010$GoalsPM, ties.method = "min")
+df2010$AssistsPMLR <- rank(-df2010$AssistsPM, ties.method = "min")
+df2010$PointsPMLR <- rank(-df2010$PointsPM, ties.method = "min")
+df2010$PlusMinusPMLR <- rank(-df2010$PlusMinusPM, ties.method = "min")
+df2010$PenaltyMinutesPMLR <- rank(-df2010$PenaltyMinutesPM, ties.method = "min")
+df2010$EvenStrGoalsPMLR <- rank(-df2010$EvenStrGoalsPM, ties.method = "min")
+df2010$EvenStrPointsPMLR <- rank(-df2010$EvenStrPointsPM, ties.method = "min")
+df2010$ppGoalsPMLR <- rank(-df2010$ppGoalsPM, ties.method = "min")
+df2010$ppPointsPMLR <- rank(-df2010$ppPointsPM, ties.method = "min")
+df2010$shGoalsPMLR <- rank(-df2010$shGoalsPM, ties.method = "min")
+df2010$shPointsPMLR <- rank(-df2010$shPointsPM, ties.method = "min")
+df2010$GameWinningGoalsPMLR <- rank(-df2010$GameWinningGoalsPM, ties.method = "min")
+df2010$ShotsPMLR <- rank(-df2010$ShotsPM, ties.method = "min")
+df2010$AAVPMLR <- rank(-df2010$AAVPM, ties.method = "min")
+
+#Create a dataframe for 2011
+df2011 <- subset(dfTaxed, SeasonEnding == "2011")
+df2011$GamesPlayedLR <- rank(-df2011$GamesPlayed, ties.method = "min")
+df2011$GoalsLR <- rank(-df2011$Goals, ties.method = "min")
+df2011$AssistsLR <- rank(-df2011$Assists, ties.method = "min")
+df2011$PointsLR <- rank(-df2011$Points, ties.method = "min")
+df2011$PlusMinusLR <- rank(-df2011$PlusMinus, ties.method = "min")
+df2011$PenaltyMinutesLR <- rank(-df2011$PenaltyMinutes, ties.method = "min")
+df2011$EvenStrGoalsLR <- rank(-df2011$EvenStrGoals, ties.method = "min")
+df2011$EvenStrPointsLR <- rank(-df2011$EvenStrPoints, ties.method = "min")
+df2011$ppGoalsLR <- rank(-df2011$ppGoals, ties.method = "min")
+df2011$ppPointsLR <- rank(-df2011$ppPoints, ties.method = "min")
+df2011$shGoalsLR <- rank(-df2011$shGoals, ties.method = "min")
+df2011$shPointsLR <- rank(-df2011$shPoints, ties.method = "min")
+df2011$GameWinningGoalsLR <- rank(-df2011$GameWinningGoals, ties.method = "min")
+df2011$ShotsLR <- rank(-df2011$Shots, ties.method = "min")
+df2011$avgTOILR <- rank(-df2011$avgTOI, ties.method = "min")
+df2011$AAVLR <- rank(-df2011$AAV, ties.method = "min")
+df2011$GoalsPGLR <- rank(-df2011$GoalsPG, ties.method = "min")
+df2011$AssistsPGLR <- rank(-df2011$AssistsPG, ties.method = "min")
+df2011$PointsPGLR <- rank(-df2011$PointsPG, ties.method = "min")
+df2011$PlusMinusPGLR <- rank(-df2011$PlusMinusPG, ties.method = "min")
+df2011$PenaltyMinutesPGLR <- rank(-df2011$PenaltyMinutesPG, ties.method = "min")
+df2011$EvenStrGoalsPGLR <- rank(-df2011$EvenStrGoalsPG, ties.method = "min")
+df2011$EvenStrPointsPGLR <- rank(-df2011$EvenStrPointsPG, ties.method = "min")
+df2011$ppGoalsPGLR <- rank(-df2011$ppGoalsPG, ties.method = "min")
+df2011$ppPointsPGLR <- rank(-df2011$ppPointsPG, ties.method = "min")
+df2011$shGoalsPGLR <- rank(-df2011$shGoalsPG, ties.method = "min")
+df2011$shPointsPGLR <- rank(-df2011$shPointsPG, ties.method = "min")
+df2011$GameWinningGoalsPGLR <- rank(-df2011$GameWinningGoalsPG, ties.method = "min")
+df2011$ShotsPGLR <- rank(-df2011$ShotsPG, ties.method = "min")
+df2011$AAVPGLR <- rank(-df2011$AAVPG, ties.method = "min")
+df2011$GoalsPMLR <- rank(-df2011$GoalsPM, ties.method = "min")
+df2011$AssistsPMLR <- rank(-df2011$AssistsPM, ties.method = "min")
+df2011$PointsPMLR <- rank(-df2011$PointsPM, ties.method = "min")
+df2011$PlusMinusPMLR <- rank(-df2011$PlusMinusPM, ties.method = "min")
+df2011$PenaltyMinutesPMLR <- rank(-df2011$PenaltyMinutesPM, ties.method = "min")
+df2011$EvenStrGoalsPMLR <- rank(-df2011$EvenStrGoalsPM, ties.method = "min")
+df2011$EvenStrPointsPMLR <- rank(-df2011$EvenStrPointsPM, ties.method = "min")
+df2011$ppGoalsPMLR <- rank(-df2011$ppGoalsPM, ties.method = "min")
+df2011$ppPointsPMLR <- rank(-df2011$ppPointsPM, ties.method = "min")
+df2011$shGoalsPMLR <- rank(-df2011$shGoalsPM, ties.method = "min")
+df2011$shPointsPMLR <- rank(-df2011$shPointsPM, ties.method = "min")
+df2011$GameWinningGoalsPMLR <- rank(-df2011$GameWinningGoalsPM, ties.method = "min")
+df2011$ShotsPMLR <- rank(-df2011$ShotsPM, ties.method = "min")
+df2011$AAVPMLR <- rank(-df2011$AAVPM, ties.method = "min")
+
+#Create a dataframe for 2012
+df2012 <- subset(dfTaxed, SeasonEnding == "2012")
+df2012$GamesPlayedLR <- rank(-df2012$GamesPlayed, ties.method = "min")
+df2012$GoalsLR <- rank(-df2012$Goals, ties.method = "min")
+df2012$AssistsLR <- rank(-df2012$Assists, ties.method = "min")
+df2012$PointsLR <- rank(-df2012$Points, ties.method = "min")
+df2012$PlusMinusLR <- rank(-df2012$PlusMinus, ties.method = "min")
+df2012$PenaltyMinutesLR <- rank(-df2012$PenaltyMinutes, ties.method = "min")
+df2012$EvenStrGoalsLR <- rank(-df2012$EvenStrGoals, ties.method = "min")
+df2012$EvenStrPointsLR <- rank(-df2012$EvenStrPoints, ties.method = "min")
+df2012$ppGoalsLR <- rank(-df2012$ppGoals, ties.method = "min")
+df2012$ppPointsLR <- rank(-df2012$ppPoints, ties.method = "min")
+df2012$shGoalsLR <- rank(-df2012$shGoals, ties.method = "min")
+df2012$shPointsLR <- rank(-df2012$shPoints, ties.method = "min")
+df2012$GameWinningGoalsLR <- rank(-df2012$GameWinningGoals, ties.method = "min")
+df2012$ShotsLR <- rank(-df2012$Shots, ties.method = "min")
+df2012$avgTOILR <- rank(-df2012$avgTOI, ties.method = "min")
+df2012$AAVLR <- rank(-df2012$AAV, ties.method = "min")
+df2012$GoalsPGLR <- rank(-df2012$GoalsPG, ties.method = "min")
+df2012$AssistsPGLR <- rank(-df2012$AssistsPG, ties.method = "min")
+df2012$PointsPGLR <- rank(-df2012$PointsPG, ties.method = "min")
+df2012$PlusMinusPGLR <- rank(-df2012$PlusMinusPG, ties.method = "min")
+df2012$PenaltyMinutesPGLR <- rank(-df2012$PenaltyMinutesPG, ties.method = "min")
+df2012$EvenStrGoalsPGLR <- rank(-df2012$EvenStrGoalsPG, ties.method = "min")
+df2012$EvenStrPointsPGLR <- rank(-df2012$EvenStrPointsPG, ties.method = "min")
+df2012$ppGoalsPGLR <- rank(-df2012$ppGoalsPG, ties.method = "min")
+df2012$ppPointsPGLR <- rank(-df2012$ppPointsPG, ties.method = "min")
+df2012$shGoalsPGLR <- rank(-df2012$shGoalsPG, ties.method = "min")
+df2012$shPointsPGLR <- rank(-df2012$shPointsPG, ties.method = "min")
+df2012$GameWinningGoalsPGLR <- rank(-df2012$GameWinningGoalsPG, ties.method = "min")
+df2012$ShotsPGLR <- rank(-df2012$ShotsPG, ties.method = "min")
+df2012$AAVPGLR <- rank(-df2012$AAVPG, ties.method = "min")
+df2012$GoalsPMLR <- rank(-df2012$GoalsPM, ties.method = "min")
+df2012$AssistsPMLR <- rank(-df2012$AssistsPM, ties.method = "min")
+df2012$PointsPMLR <- rank(-df2012$PointsPM, ties.method = "min")
+df2012$PlusMinusPMLR <- rank(-df2012$PlusMinusPM, ties.method = "min")
+df2012$PenaltyMinutesPMLR <- rank(-df2012$PenaltyMinutesPM, ties.method = "min")
+df2012$EvenStrGoalsPMLR <- rank(-df2012$EvenStrGoalsPM, ties.method = "min")
+df2012$EvenStrPointsPMLR <- rank(-df2012$EvenStrPointsPM, ties.method = "min")
+df2012$ppGoalsPMLR <- rank(-df2012$ppGoalsPM, ties.method = "min")
+df2012$ppPointsPMLR <- rank(-df2012$ppPointsPM, ties.method = "min")
+df2012$shGoalsPMLR <- rank(-df2012$shGoalsPM, ties.method = "min")
+df2012$shPointsPMLR <- rank(-df2012$shPointsPM, ties.method = "min")
+df2012$GameWinningGoalsPMLR <- rank(-df2012$GameWinningGoalsPM, ties.method = "min")
+df2012$ShotsPMLR <- rank(-df2012$ShotsPM, ties.method = "min")
+df2012$AAVPMLR <- rank(-df2012$AAVPM, ties.method = "min")
+
+#Create a dataframe for 2013
+df2013 <- subset(dfTaxed, SeasonEnding == "2013")
+df2013$GamesPlayedLR <- rank(-df2013$GamesPlayed, ties.method = "min")
+df2013$GoalsLR <- rank(-df2013$Goals, ties.method = "min")
+df2013$AssistsLR <- rank(-df2013$Assists, ties.method = "min")
+df2013$PointsLR <- rank(-df2013$Points, ties.method = "min")
+df2013$PlusMinusLR <- rank(-df2013$PlusMinus, ties.method = "min")
+df2013$PenaltyMinutesLR <- rank(-df2013$PenaltyMinutes, ties.method = "min")
+df2013$EvenStrGoalsLR <- rank(-df2013$EvenStrGoals, ties.method = "min")
+df2013$EvenStrPointsLR <- rank(-df2013$EvenStrPoints, ties.method = "min")
+df2013$ppGoalsLR <- rank(-df2013$ppGoals, ties.method = "min")
+df2013$ppPointsLR <- rank(-df2013$ppPoints, ties.method = "min")
+df2013$shGoalsLR <- rank(-df2013$shGoals, ties.method = "min")
+df2013$shPointsLR <- rank(-df2013$shPoints, ties.method = "min")
+df2013$GameWinningGoalsLR <- rank(-df2013$GameWinningGoals, ties.method = "min")
+df2013$ShotsLR <- rank(-df2013$Shots, ties.method = "min")
+df2013$avgTOILR <- rank(-df2013$avgTOI, ties.method = "min")
+df2013$AAVLR <- rank(-df2013$AAV, ties.method = "min")
+df2013$GoalsPGLR <- rank(-df2013$GoalsPG, ties.method = "min")
+df2013$AssistsPGLR <- rank(-df2013$AssistsPG, ties.method = "min")
+df2013$PointsPGLR <- rank(-df2013$PointsPG, ties.method = "min")
+df2013$PlusMinusPGLR <- rank(-df2013$PlusMinusPG, ties.method = "min")
+df2013$PenaltyMinutesPGLR <- rank(-df2013$PenaltyMinutesPG, ties.method = "min")
+df2013$EvenStrGoalsPGLR <- rank(-df2013$EvenStrGoalsPG, ties.method = "min")
+df2013$EvenStrPointsPGLR <- rank(-df2013$EvenStrPointsPG, ties.method = "min")
+df2013$ppGoalsPGLR <- rank(-df2013$ppGoalsPG, ties.method = "min")
+df2013$ppPointsPGLR <- rank(-df2013$ppPointsPG, ties.method = "min")
+df2013$shGoalsPGLR <- rank(-df2013$shGoalsPG, ties.method = "min")
+df2013$shPointsPGLR <- rank(-df2013$shPointsPG, ties.method = "min")
+df2013$GameWinningGoalsPGLR <- rank(-df2013$GameWinningGoalsPG, ties.method = "min")
+df2013$ShotsPGLR <- rank(-df2013$ShotsPG, ties.method = "min")
+df2013$AAVPGLR <- rank(-df2013$AAVPG, ties.method = "min")
+df2013$GoalsPMLR <- rank(-df2013$GoalsPM, ties.method = "min")
+df2013$AssistsPMLR <- rank(-df2013$AssistsPM, ties.method = "min")
+df2013$PointsPMLR <- rank(-df2013$PointsPM, ties.method = "min")
+df2013$PlusMinusPMLR <- rank(-df2013$PlusMinusPM, ties.method = "min")
+df2013$PenaltyMinutesPMLR <- rank(-df2013$PenaltyMinutesPM, ties.method = "min")
+df2013$EvenStrGoalsPMLR <- rank(-df2013$EvenStrGoalsPM, ties.method = "min")
+df2013$EvenStrPointsPMLR <- rank(-df2013$EvenStrPointsPM, ties.method = "min")
+df2013$ppGoalsPMLR <- rank(-df2013$ppGoalsPM, ties.method = "min")
+df2013$ppPointsPMLR <- rank(-df2013$ppPointsPM, ties.method = "min")
+df2013$shGoalsPMLR <- rank(-df2013$shGoalsPM, ties.method = "min")
+df2013$shPointsPMLR <- rank(-df2013$shPointsPM, ties.method = "min")
+df2013$GameWinningGoalsPMLR <- rank(-df2013$GameWinningGoalsPM, ties.method = "min")
+df2013$ShotsPMLR <- rank(-df2013$ShotsPM, ties.method = "min")
+df2013$AAVPMLR <- rank(-df2013$AAVPM, ties.method = "min")
+
+#Create a dataframe for 2014
+df2014 <- subset(dfTaxed, SeasonEnding == "2014")
+df2014$GamesPlayedLR <- rank(-df2014$GamesPlayed, ties.method = "min")
+df2014$GoalsLR <- rank(-df2014$Goals, ties.method = "min")
+df2014$AssistsLR <- rank(-df2014$Assists, ties.method = "min")
+df2014$PointsLR <- rank(-df2014$Points, ties.method = "min")
+df2014$PlusMinusLR <- rank(-df2014$PlusMinus, ties.method = "min")
+df2014$PenaltyMinutesLR <- rank(-df2014$PenaltyMinutes, ties.method = "min")
+df2014$EvenStrGoalsLR <- rank(-df2014$EvenStrGoals, ties.method = "min")
+df2014$EvenStrPointsLR <- rank(-df2014$EvenStrPoints, ties.method = "min")
+df2014$ppGoalsLR <- rank(-df2014$ppGoals, ties.method = "min")
+df2014$ppPointsLR <- rank(-df2014$ppPoints, ties.method = "min")
+df2014$shGoalsLR <- rank(-df2014$shGoals, ties.method = "min")
+df2014$shPointsLR <- rank(-df2014$shPoints, ties.method = "min")
+df2014$GameWinningGoalsLR <- rank(-df2014$GameWinningGoals, ties.method = "min")
+df2014$ShotsLR <- rank(-df2014$Shots, ties.method = "min")
+df2014$avgTOILR <- rank(-df2014$avgTOI, ties.method = "min")
+df2014$AAVLR <- rank(-df2014$AAV, ties.method = "min")
+df2014$GoalsPGLR <- rank(-df2014$GoalsPG, ties.method = "min")
+df2014$AssistsPGLR <- rank(-df2014$AssistsPG, ties.method = "min")
+df2014$PointsPGLR <- rank(-df2014$PointsPG, ties.method = "min")
+df2014$PlusMinusPGLR <- rank(-df2014$PlusMinusPG, ties.method = "min")
+df2014$PenaltyMinutesPGLR <- rank(-df2014$PenaltyMinutesPG, ties.method = "min")
+df2014$EvenStrGoalsPGLR <- rank(-df2014$EvenStrGoalsPG, ties.method = "min")
+df2014$EvenStrPointsPGLR <- rank(-df2014$EvenStrPointsPG, ties.method = "min")
+df2014$ppGoalsPGLR <- rank(-df2014$ppGoalsPG, ties.method = "min")
+df2014$ppPointsPGLR <- rank(-df2014$ppPointsPG, ties.method = "min")
+df2014$shGoalsPGLR <- rank(-df2014$shGoalsPG, ties.method = "min")
+df2014$shPointsPGLR <- rank(-df2014$shPointsPG, ties.method = "min")
+df2014$GameWinningGoalsPGLR <- rank(-df2014$GameWinningGoalsPG, ties.method = "min")
+df2014$ShotsPGLR <- rank(-df2014$ShotsPG, ties.method = "min")
+df2014$AAVPGLR <- rank(-df2014$AAVPG, ties.method = "min")
+df2014$GoalsPMLR <- rank(-df2014$GoalsPM, ties.method = "min")
+df2014$AssistsPMLR <- rank(-df2014$AssistsPM, ties.method = "min")
+df2014$PointsPMLR <- rank(-df2014$PointsPM, ties.method = "min")
+df2014$PlusMinusPMLR <- rank(-df2014$PlusMinusPM, ties.method = "min")
+df2014$PenaltyMinutesPMLR <- rank(-df2014$PenaltyMinutesPM, ties.method = "min")
+df2014$EvenStrGoalsPMLR <- rank(-df2014$EvenStrGoalsPM, ties.method = "min")
+df2014$EvenStrPointsPMLR <- rank(-df2014$EvenStrPointsPM, ties.method = "min")
+df2014$ppGoalsPMLR <- rank(-df2014$ppGoalsPM, ties.method = "min")
+df2014$ppPointsPMLR <- rank(-df2014$ppPointsPM, ties.method = "min")
+df2014$shGoalsPMLR <- rank(-df2014$shGoalsPM, ties.method = "min")
+df2014$shPointsPMLR <- rank(-df2014$shPointsPM, ties.method = "min")
+df2014$GameWinningGoalsPMLR <- rank(-df2014$GameWinningGoalsPM, ties.method = "min")
+df2014$ShotsPMLR <- rank(-df2014$ShotsPM, ties.method = "min")
+df2014$AAVPMLR <- rank(-df2014$AAVPM, ties.method = "min")
+
+#Create a dataframe for 2015
+df2015 <- subset(dfTaxed, SeasonEnding == "2015")
+df2015$GamesPlayedLR <- rank(-df2015$GamesPlayed, ties.method = "min")
+df2015$GoalsLR <- rank(-df2015$Goals, ties.method = "min")
+df2015$AssistsLR <- rank(-df2015$Assists, ties.method = "min")
+df2015$PointsLR <- rank(-df2015$Points, ties.method = "min")
+df2015$PlusMinusLR <- rank(-df2015$PlusMinus, ties.method = "min")
+df2015$PenaltyMinutesLR <- rank(-df2015$PenaltyMinutes, ties.method = "min")
+df2015$EvenStrGoalsLR <- rank(-df2015$EvenStrGoals, ties.method = "min")
+df2015$EvenStrPointsLR <- rank(-df2015$EvenStrPoints, ties.method = "min")
+df2015$ppGoalsLR <- rank(-df2015$ppGoals, ties.method = "min")
+df2015$ppPointsLR <- rank(-df2015$ppPoints, ties.method = "min")
+df2015$shGoalsLR <- rank(-df2015$shGoals, ties.method = "min")
+df2015$shPointsLR <- rank(-df2015$shPoints, ties.method = "min")
+df2015$GameWinningGoalsLR <- rank(-df2015$GameWinningGoals, ties.method = "min")
+df2015$ShotsLR <- rank(-df2015$Shots, ties.method = "min")
+df2015$avgTOILR <- rank(-df2015$avgTOI, ties.method = "min")
+df2015$AAVLR <- rank(-df2015$AAV, ties.method = "min")
+df2015$GoalsPGLR <- rank(-df2015$GoalsPG, ties.method = "min")
+df2015$AssistsPGLR <- rank(-df2015$AssistsPG, ties.method = "min")
+df2015$PointsPGLR <- rank(-df2015$PointsPG, ties.method = "min")
+df2015$PlusMinusPGLR <- rank(-df2015$PlusMinusPG, ties.method = "min")
+df2015$PenaltyMinutesPGLR <- rank(-df2015$PenaltyMinutesPG, ties.method = "min")
+df2015$EvenStrGoalsPGLR <- rank(-df2015$EvenStrGoalsPG, ties.method = "min")
+df2015$EvenStrPointsPGLR <- rank(-df2015$EvenStrPointsPG, ties.method = "min")
+df2015$ppGoalsPGLR <- rank(-df2015$ppGoalsPG, ties.method = "min")
+df2015$ppPointsPGLR <- rank(-df2015$ppPointsPG, ties.method = "min")
+df2015$shGoalsPGLR <- rank(-df2015$shGoalsPG, ties.method = "min")
+df2015$shPointsPGLR <- rank(-df2015$shPointsPG, ties.method = "min")
+df2015$GameWinningGoalsPGLR <- rank(-df2015$GameWinningGoalsPG, ties.method = "min")
+df2015$ShotsPGLR <- rank(-df2015$ShotsPG, ties.method = "min")
+df2015$AAVPGLR <- rank(-df2015$AAVPG, ties.method = "min")
+df2015$GoalsPMLR <- rank(-df2015$GoalsPM, ties.method = "min")
+df2015$AssistsPMLR <- rank(-df2015$AssistsPM, ties.method = "min")
+df2015$PointsPMLR <- rank(-df2015$PointsPM, ties.method = "min")
+df2015$PlusMinusPMLR <- rank(-df2015$PlusMinusPM, ties.method = "min")
+df2015$PenaltyMinutesPMLR <- rank(-df2015$PenaltyMinutesPM, ties.method = "min")
+df2015$EvenStrGoalsPMLR <- rank(-df2015$EvenStrGoalsPM, ties.method = "min")
+df2015$EvenStrPointsPMLR <- rank(-df2015$EvenStrPointsPM, ties.method = "min")
+df2015$ppGoalsPMLR <- rank(-df2015$ppGoalsPM, ties.method = "min")
+df2015$ppPointsPMLR <- rank(-df2015$ppPointsPM, ties.method = "min")
+df2015$shGoalsPMLR <- rank(-df2015$shGoalsPM, ties.method = "min")
+df2015$shPointsPMLR <- rank(-df2015$shPointsPM, ties.method = "min")
+df2015$GameWinningGoalsPMLR <- rank(-df2015$GameWinningGoalsPM, ties.method = "min")
+df2015$ShotsPMLR <- rank(-df2015$ShotsPM, ties.method = "min")
+df2015$AAVPMLR <- rank(-df2015$AAVPM, ties.method = "min")
+
+#Create a dataframe for 2016
+df2016 <- subset(dfTaxed, SeasonEnding == "2016")
+df2016$GamesPlayedLR <- rank(-df2016$GamesPlayed, ties.method = "min")
+df2016$GoalsLR <- rank(-df2016$Goals, ties.method = "min")
+df2016$AssistsLR <- rank(-df2016$Assists, ties.method = "min")
+df2016$PointsLR <- rank(-df2016$Points, ties.method = "min")
+df2016$PlusMinusLR <- rank(-df2016$PlusMinus, ties.method = "min")
+df2016$PenaltyMinutesLR <- rank(-df2016$PenaltyMinutes, ties.method = "min")
+df2016$EvenStrGoalsLR <- rank(-df2016$EvenStrGoals, ties.method = "min")
+df2016$EvenStrPointsLR <- rank(-df2016$EvenStrPoints, ties.method = "min")
+df2016$ppGoalsLR <- rank(-df2016$ppGoals, ties.method = "min")
+df2016$ppPointsLR <- rank(-df2016$ppPoints, ties.method = "min")
+df2016$shGoalsLR <- rank(-df2016$shGoals, ties.method = "min")
+df2016$shPointsLR <- rank(-df2016$shPoints, ties.method = "min")
+df2016$GameWinningGoalsLR <- rank(-df2016$GameWinningGoals, ties.method = "min")
+df2016$ShotsLR <- rank(-df2016$Shots, ties.method = "min")
+df2016$avgTOILR <- rank(-df2016$avgTOI, ties.method = "min")
+df2016$AAVLR <- rank(-df2016$AAV, ties.method = "min")
+df2016$GoalsPGLR <- rank(-df2016$GoalsPG, ties.method = "min")
+df2016$AssistsPGLR <- rank(-df2016$AssistsPG, ties.method = "min")
+df2016$PointsPGLR <- rank(-df2016$PointsPG, ties.method = "min")
+df2016$PlusMinusPGLR <- rank(-df2016$PlusMinusPG, ties.method = "min")
+df2016$PenaltyMinutesPGLR <- rank(-df2016$PenaltyMinutesPG, ties.method = "min")
+df2016$EvenStrGoalsPGLR <- rank(-df2016$EvenStrGoalsPG, ties.method = "min")
+df2016$EvenStrPointsPGLR <- rank(-df2016$EvenStrPointsPG, ties.method = "min")
+df2016$ppGoalsPGLR <- rank(-df2016$ppGoalsPG, ties.method = "min")
+df2016$ppPointsPGLR <- rank(-df2016$ppPointsPG, ties.method = "min")
+df2016$shGoalsPGLR <- rank(-df2016$shGoalsPG, ties.method = "min")
+df2016$shPointsPGLR <- rank(-df2016$shPointsPG, ties.method = "min")
+df2016$GameWinningGoalsPGLR <- rank(-df2016$GameWinningGoalsPG, ties.method = "min")
+df2016$ShotsPGLR <- rank(-df2016$ShotsPG, ties.method = "min")
+df2016$AAVPGLR <- rank(-df2016$AAVPG, ties.method = "min")
+df2016$GoalsPMLR <- rank(-df2016$GoalsPM, ties.method = "min")
+df2016$AssistsPMLR <- rank(-df2016$AssistsPM, ties.method = "min")
+df2016$PointsPMLR <- rank(-df2016$PointsPM, ties.method = "min")
+df2016$PlusMinusPMLR <- rank(-df2016$PlusMinusPM, ties.method = "min")
+df2016$PenaltyMinutesPMLR <- rank(-df2016$PenaltyMinutesPM, ties.method = "min")
+df2016$EvenStrGoalsPMLR <- rank(-df2016$EvenStrGoalsPM, ties.method = "min")
+df2016$EvenStrPointsPMLR <- rank(-df2016$EvenStrPointsPM, ties.method = "min")
+df2016$ppGoalsPMLR <- rank(-df2016$ppGoalsPM, ties.method = "min")
+df2016$ppPointsPMLR <- rank(-df2016$ppPointsPM, ties.method = "min")
+df2016$shGoalsPMLR <- rank(-df2016$shGoalsPM, ties.method = "min")
+df2016$shPointsPMLR <- rank(-df2016$shPointsPM, ties.method = "min")
+df2016$GameWinningGoalsPMLR <- rank(-df2016$GameWinningGoalsPM, ties.method = "min")
+df2016$ShotsPMLR <- rank(-df2016$ShotsPM, ties.method = "min")
+df2016$AAVPMLR <- rank(-df2016$AAVPM, ties.method = "min")
+
+#Create a dataframe for 2017
+df2017 <- subset(dfTaxed, SeasonEnding == "2017")
+df2017$GamesPlayedLR <- rank(-df2017$GamesPlayed, ties.method = "min")
+df2017$GoalsLR <- rank(-df2017$Goals, ties.method = "min")
+df2017$AssistsLR <- rank(-df2017$Assists, ties.method = "min")
+df2017$PointsLR <- rank(-df2017$Points, ties.method = "min")
+df2017$PlusMinusLR <- rank(-df2017$PlusMinus, ties.method = "min")
+df2017$PenaltyMinutesLR <- rank(-df2017$PenaltyMinutes, ties.method = "min")
+df2017$EvenStrGoalsLR <- rank(-df2017$EvenStrGoals, ties.method = "min")
+df2017$EvenStrPointsLR <- rank(-df2017$EvenStrPoints, ties.method = "min")
+df2017$ppGoalsLR <- rank(-df2017$ppGoals, ties.method = "min")
+df2017$ppPointsLR <- rank(-df2017$ppPoints, ties.method = "min")
+df2017$shGoalsLR <- rank(-df2017$shGoals, ties.method = "min")
+df2017$shPointsLR <- rank(-df2017$shPoints, ties.method = "min")
+df2017$GameWinningGoalsLR <- rank(-df2017$GameWinningGoals, ties.method = "min")
+df2017$ShotsLR <- rank(-df2017$Shots, ties.method = "min")
+df2017$avgTOILR <- rank(-df2017$avgTOI, ties.method = "min")
+df2017$AAVLR <- rank(-df2017$AAV, ties.method = "min")
+df2017$GoalsPGLR <- rank(-df2017$GoalsPG, ties.method = "min")
+df2017$AssistsPGLR <- rank(-df2017$AssistsPG, ties.method = "min")
+df2017$PointsPGLR <- rank(-df2017$PointsPG, ties.method = "min")
+df2017$PlusMinusPGLR <- rank(-df2017$PlusMinusPG, ties.method = "min")
+df2017$PenaltyMinutesPGLR <- rank(-df2017$PenaltyMinutesPG, ties.method = "min")
+df2017$EvenStrGoalsPGLR <- rank(-df2017$EvenStrGoalsPG, ties.method = "min")
+df2017$EvenStrPointsPGLR <- rank(-df2017$EvenStrPointsPG, ties.method = "min")
+df2017$ppGoalsPGLR <- rank(-df2017$ppGoalsPG, ties.method = "min")
+df2017$ppPointsPGLR <- rank(-df2017$ppPointsPG, ties.method = "min")
+df2017$shGoalsPGLR <- rank(-df2017$shGoalsPG, ties.method = "min")
+df2017$shPointsPGLR <- rank(-df2017$shPointsPG, ties.method = "min")
+df2017$GameWinningGoalsPGLR <- rank(-df2017$GameWinningGoalsPG, ties.method = "min")
+df2017$ShotsPGLR <- rank(-df2017$ShotsPG, ties.method = "min")
+df2017$AAVPGLR <- rank(-df2017$AAVPG, ties.method = "min")
+df2017$GoalsPMLR <- rank(-df2017$GoalsPM, ties.method = "min")
+df2017$AssistsPMLR <- rank(-df2017$AssistsPM, ties.method = "min")
+df2017$PointsPMLR <- rank(-df2017$PointsPM, ties.method = "min")
+df2017$PlusMinusPMLR <- rank(-df2017$PlusMinusPM, ties.method = "min")
+df2017$PenaltyMinutesPMLR <- rank(-df2017$PenaltyMinutesPM, ties.method = "min")
+df2017$EvenStrGoalsPMLR <- rank(-df2017$EvenStrGoalsPM, ties.method = "min")
+df2017$EvenStrPointsPMLR <- rank(-df2017$EvenStrPointsPM, ties.method = "min")
+df2017$ppGoalsPMLR <- rank(-df2017$ppGoalsPM, ties.method = "min")
+df2017$ppPointsPMLR <- rank(-df2017$ppPointsPM, ties.method = "min")
+df2017$shGoalsPMLR <- rank(-df2017$shGoalsPM, ties.method = "min")
+df2017$shPointsPMLR <- rank(-df2017$shPointsPM, ties.method = "min")
+df2017$GameWinningGoalsPMLR <- rank(-df2017$GameWinningGoalsPM, ties.method = "min")
+df2017$ShotsPMLR <- rank(-df2017$ShotsPM, ties.method = "min")
+df2017$AAVPMLR <- rank(-df2017$AAVPM, ties.method = "min")
+
+#Create a dataframe for 2018
+df2018 <- subset(testDF, SeasonEnding == "2018")
+df2018$GamesPlayedLR <- rank(-df2018$GamesPlayed, ties.method = "min")
+df2018$GoalsLR <- rank(-df2018$Goals, ties.method = "min")
+df2018$AssistsLR <- rank(-df2018$Assists, ties.method = "min")
+df2018$PointsLR <- rank(-df2018$Points, ties.method = "min")
+df2018$PlusMinusLR <- rank(-df2018$PlusMinus, ties.method = "min")
+df2018$PenaltyMinutesLR <- rank(-df2018$PenaltyMinutes, ties.method = "min")
+df2018$EvenStrGoalsLR <- rank(-df2018$EvenStrGoals, ties.method = "min")
+df2018$EvenStrPointsLR <- rank(-df2018$EvenStrPoints, ties.method = "min")
+df2018$ppGoalsLR <- rank(-df2018$ppGoals, ties.method = "min")
+df2018$ppPointsLR <- rank(-df2018$ppPoints, ties.method = "min")
+df2018$shGoalsLR <- rank(-df2018$shGoals, ties.method = "min")
+df2018$shPointsLR <- rank(-df2018$shPoints, ties.method = "min")
+df2018$GameWinningGoalsLR <- rank(-df2018$GameWinningGoals, ties.method = "min")
+df2018$ShotsLR <- rank(-df2018$Shots, ties.method = "min")
+df2018$avgTOILR <- rank(-df2018$avgTOI, ties.method = "min")
+df2018$AAVLR <- rank(-df2018$AAV, ties.method = "min")
+df2018$GoalsPGLR <- rank(-df2018$GoalsPG, ties.method = "min")
+df2018$AssistsPGLR <- rank(-df2018$AssistsPG, ties.method = "min")
+df2018$PointsPGLR <- rank(-df2018$PointsPG, ties.method = "min")
+df2018$PlusMinusPGLR <- rank(-df2018$PlusMinusPG, ties.method = "min")
+df2018$PenaltyMinutesPGLR <- rank(-df2018$PenaltyMinutesPG, ties.method = "min")
+df2018$EvenStrGoalsPGLR <- rank(-df2018$EvenStrGoalsPG, ties.method = "min")
+df2018$EvenStrPointsPGLR <- rank(-df2018$EvenStrPointsPG, ties.method = "min")
+df2018$ppGoalsPGLR <- rank(-df2018$ppGoalsPG, ties.method = "min")
+df2018$ppPointsPGLR <- rank(-df2018$ppPointsPG, ties.method = "min")
+df2018$shGoalsPGLR <- rank(-df2018$shGoalsPG, ties.method = "min")
+df2018$shPointsPGLR <- rank(-df2018$shPointsPG, ties.method = "min")
+df2018$GameWinningGoalsPGLR <- rank(-df2018$GameWinningGoalsPG, ties.method = "min")
+df2018$ShotsPGLR <- rank(-df2018$ShotsPG, ties.method = "min")
+df2018$AAVPGLR <- rank(-df2018$AAVPG, ties.method = "min")
+df2018$GoalsPMLR <- rank(-df2018$GoalsPM, ties.method = "min")
+df2018$AssistsPMLR <- rank(-df2018$AssistsPM, ties.method = "min")
+df2018$PointsPMLR <- rank(-df2018$PointsPM, ties.method = "min")
+df2018$PlusMinusPMLR <- rank(-df2018$PlusMinusPM, ties.method = "min")
+df2018$PenaltyMinutesPMLR <- rank(-df2018$PenaltyMinutesPM, ties.method = "min")
+df2018$EvenStrGoalsPMLR <- rank(-df2018$EvenStrGoalsPM, ties.method = "min")
+df2018$EvenStrPointsPMLR <- rank(-df2018$EvenStrPointsPM, ties.method = "min")
+df2018$ppGoalsPMLR <- rank(-df2018$ppGoalsPM, ties.method = "min")
+df2018$ppPointsPMLR <- rank(-df2018$ppPointsPM, ties.method = "min")
+df2018$shGoalsPMLR <- rank(-df2018$shGoalsPM, ties.method = "min")
+df2018$shPointsPMLR <- rank(-df2018$shPointsPM, ties.method = "min")
+df2018$GameWinningGoalsPMLR <- rank(-df2018$GameWinningGoalsPM, ties.method = "min")
+df2018$ShotsPMLR <- rank(-df2018$ShotsPM, ties.method = "min")
+df2018$AAVPMLR <- rank(-df2018$AAVPM, ties.method = "min")
+
+#Create a dataframe for 2019
+df2019 <- subset(testDF, SeasonEnding == "2019")
+df2019$GamesPlayedLR <- rank(-df2019$GamesPlayed, ties.method = "min")
+df2019$GoalsLR <- rank(-df2019$Goals, ties.method = "min")
+df2019$AssistsLR <- rank(-df2019$Assists, ties.method = "min")
+df2019$PointsLR <- rank(-df2019$Points, ties.method = "min")
+df2019$PlusMinusLR <- rank(-df2019$PlusMinus, ties.method = "min")
+df2019$PenaltyMinutesLR <- rank(-df2019$PenaltyMinutes, ties.method = "min")
+df2019$EvenStrGoalsLR <- rank(-df2019$EvenStrGoals, ties.method = "min")
+df2019$EvenStrPointsLR <- rank(-df2019$EvenStrPoints, ties.method = "min")
+df2019$ppGoalsLR <- rank(-df2019$ppGoals, ties.method = "min")
+df2019$ppPointsLR <- rank(-df2019$ppPoints, ties.method = "min")
+df2019$shGoalsLR <- rank(-df2019$shGoals, ties.method = "min")
+df2019$shPointsLR <- rank(-df2019$shPoints, ties.method = "min")
+df2019$GameWinningGoalsLR <- rank(-df2019$GameWinningGoals, ties.method = "min")
+df2019$ShotsLR <- rank(-df2019$Shots, ties.method = "min")
+df2019$avgTOILR <- rank(-df2019$avgTOI, ties.method = "min")
+df2019$AAVLR <- rank(-df2019$AAV, ties.method = "min")
+df2019$GoalsPGLR <- rank(-df2019$GoalsPG, ties.method = "min")
+df2019$AssistsPGLR <- rank(-df2019$AssistsPG, ties.method = "min")
+df2019$PointsPGLR <- rank(-df2019$PointsPG, ties.method = "min")
+df2019$PlusMinusPGLR <- rank(-df2019$PlusMinusPG, ties.method = "min")
+df2019$PenaltyMinutesPGLR <- rank(-df2019$PenaltyMinutesPG, ties.method = "min")
+df2019$EvenStrGoalsPGLR <- rank(-df2019$EvenStrGoalsPG, ties.method = "min")
+df2019$EvenStrPointsPGLR <- rank(-df2019$EvenStrPointsPG, ties.method = "min")
+df2019$ppGoalsPGLR <- rank(-df2019$ppGoalsPG, ties.method = "min")
+df2019$ppPointsPGLR <- rank(-df2019$ppPointsPG, ties.method = "min")
+df2019$shGoalsPGLR <- rank(-df2019$shGoalsPG, ties.method = "min")
+df2019$shPointsPGLR <- rank(-df2019$shPointsPG, ties.method = "min")
+df2019$GameWinningGoalsPGLR <- rank(-df2019$GameWinningGoalsPG, ties.method = "min")
+df2019$ShotsPGLR <- rank(-df2019$ShotsPG, ties.method = "min")
+df2019$AAVPGLR <- rank(-df2019$AAVPG, ties.method = "min")
+df2019$GoalsPMLR <- rank(-df2019$GoalsPM, ties.method = "min")
+df2019$AssistsPMLR <- rank(-df2019$AssistsPM, ties.method = "min")
+df2019$PointsPMLR <- rank(-df2019$PointsPM, ties.method = "min")
+df2019$PlusMinusPMLR <- rank(-df2019$PlusMinusPM, ties.method = "min")
+df2019$PenaltyMinutesPMLR <- rank(-df2019$PenaltyMinutesPM, ties.method = "min")
+df2019$EvenStrGoalsPMLR <- rank(-df2019$EvenStrGoalsPM, ties.method = "min")
+df2019$EvenStrPointsPMLR <- rank(-df2019$EvenStrPointsPM, ties.method = "min")
+df2019$ppGoalsPMLR <- rank(-df2019$ppGoalsPM, ties.method = "min")
+df2019$ppPointsPMLR <- rank(-df2019$ppPointsPM, ties.method = "min")
+df2019$shGoalsPMLR <- rank(-df2019$shGoalsPM, ties.method = "min")
+df2019$shPointsPMLR <- rank(-df2019$shPointsPM, ties.method = "min")
+df2019$GameWinningGoalsPMLR <- rank(-df2019$GameWinningGoalsPM, ties.method = "min")
+df2019$ShotsPMLR <- rank(-df2019$ShotsPM, ties.method = "min")
+df2019$AAVPMLR <- rank(-df2019$AAVPM, ties.method = "min")
+```
